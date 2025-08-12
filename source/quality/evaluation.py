@@ -13,8 +13,8 @@ from T2IBenchmark import calculate_fid
 from T2IBenchmark.datasets import get_coco_fid_stats
 
 from models import Aesthetic
-from envs import IMG_DIR, AESTHETIC_PTH
-from source.utils import set_logger, setup_logging, log_result
+from envs import IMG_DIR, LOG_DIR, AESTHETIC_PTH, FID_SD_IMAGE_PATH
+from source.utils import set_logger
 
 
 def normalized(a, axis=-1, order=2):
@@ -29,6 +29,12 @@ def evaluate_fid(input_dir):
     return fid
 
 
+# * https://github.com/boomb0om/text2image-benchmark
+def evaluate_fid_sd(input_dir):
+    fid, _ = calculate_fid(input_dir, FID_SD_IMAGE_PATH)
+    return fid
+
+
 # * https://github.com/christophschuhmann/improved-aesthetic-predictor?tab=readme-ov-file
 def evaluate_aesthetic(model_clip, preprocess, model, images, device):
     images = preprocess(images).unsqueeze(0).to(device)
@@ -38,6 +44,10 @@ def evaluate_aesthetic(model_clip, preprocess, model, images, device):
 
     im_emb_arr = normalized(image_features)
     score = model(im_emb_arr.type(torch.cuda.FloatTensor)).squeeze().cpu().data.numpy()
+
+    if isinstance(score, list):
+        score = score[0]
+
     return score
 
 
@@ -46,8 +56,8 @@ def evaluate_ImageReward(prompt, images, model):
     # * rewards = model.score("<prompt>", ["<img1_obj_or_path>", "<img2_obj_or_path>", ...])
     score = model.score(prompt, images)
     # if score is float make is list and else is just score
-    if isinstance(score, float):
-        score = [score]
+    # if isinstance(score, float):
+    #     score = [score]
     return score
 
 
@@ -84,18 +94,14 @@ def evaluate_pickscore(prompt, images, processor, model, device):
     return scores.cpu().tolist()
 
 
-def quality_evaluation(metric, task, method, target, seed, device, logger):
+def quality_evaluation(metric, task, method, target, device, logger):
 
-    assert (task in ["simple_prompt", "diverse_prompt"] and metric == "aesthetic") or (
-        task == "MS-COCO" and metric in ["ImageReward", "PickScore", "FID"]
+    assert (task == "target_image" and metric == "aesthetic") or (
+        task == "general_image" and metric in ["ImageReward", "PickScore", "FID", "FID_SD"]
     ), f"Invalid task and metric combination: {task}, {metric}"
 
-    # set log directory
-    log_file_path = setup_logging(task, method, target, seed, metric=metric)
-    logger.info(f"Log file path: {log_file_path}")
-
     # Load MS-COCO prompts
-    if task == "MS-COCO":
+    if metric in ["ImageReward", "PickScore"]:
         with open(
             "prompts/MS-COCO_val2014_30k_captions.csv", "r", encoding="utf-8"
         ) as file:
@@ -123,42 +129,48 @@ def quality_evaluation(metric, task, method, target, seed, device, logger):
         )
 
     # Evaluate the faithfulness of generated images
-    img_dir = f"{IMG_DIR}/{task}/{method}/{target}/{seed}"
+    img_dir = f"{IMG_DIR}/{task}/{method}/{target}"
 
     # for each image in the input directory, calculate the score
     if metric == "FID":
         score = evaluate_fid(img_dir)
-        with open(log_file_path, "w") as f:
-            f.write(f"FID: {score}\n")
+        score_result = score
+
+    # for each image in the input directory, calculate the score
+    if metric == "FID_SD":
+        score = evaluate_fid_sd(img_dir)
         score_result = score
 
     else:
-        with open(log_file_path, "w") as f:
-            for i in tqdm(
-                range(0, len(os.listdir(img_dir))), desc="Processing images", leave=True
-            ):
-                img = Image.open(f"{img_dir}/{i}.jpg")
+        scores = 0
+        for i in tqdm(range(0, len(os.listdir(img_dir)))):
+            img = Image.open(f"{img_dir}/{i}.jpg")
 
-                # Calculate the score
-                if metric == "aesthetic":  # aesthetic score doesn't need prompt
-                    score = evaluate_aesthetic(
-                        model_clip, preprocess, model, img, device
-                    )
-                elif metric == "ImageReward":
-                    score = evaluate_ImageReward(prompt[i], img, model)
-                elif metric == "PickScore":
-                    score = evaluate_pickscore(prompt[i], img, processor, model, device)
+            # Calculate the score
+            if metric == "aesthetic":  # aesthetic score doesn't need prompt
+                score = evaluate_aesthetic(model_clip, preprocess, model, img, device)
+            elif metric == "ImageReward":
+                score = evaluate_ImageReward(prompt[i], img, model)
+            elif metric == "PickScore":
+                score = evaluate_pickscore(prompt[i], img, processor, model, device)
 
-                f.write(f"{i}, {score}\n")
+            if isinstance(score, list):
+                score = score[0]
+            scores += score
+        score_result = scores / len(os.listdir(img_dir))
 
-                if i % 100 == 0:
-                    tqdm.write(f"{i} images processed")
 
-        df = pd.read_csv(log_file_path, header=None)
-        scores = df[1].tolist()
-        score_result = sum(scores) / len(scores)
-
-    log_result(score_result, task, method, target, seed, metric=metric)
+    if task == "general_image" and metric in ["FID", "FID_SD"]:
+        with open(f"{LOG_DIR}/results/general_image_quality.csv", "a") as f:
+            f.write(f"{method},{target},{score},{metric}\n")
+    elif task == "general_image" and metric in ["ImageReward", "PickScore"]:
+        with open(f"{LOG_DIR}/results/general_image_alignment.csv", "a") as f:
+            f.write(f"{method},{target},{score},{metric}\n")
+    elif task == "target_image" and metric == "aesthetic":
+        with open(f"{LOG_DIR}/results/target_image_quality.csv", "a") as f:
+            f.write(f"{method},{target},{score},{metric}\n")
+    else:
+        raise ValueError(f"Invalid task settings")
 
 
 if __name__ == "__main__":
@@ -166,26 +178,24 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--metric",
-        choices=["aesthetic", "ImageReward", "PickScore", "FID"],
+        choices=["aesthetic", "ImageReward", "PickScore", "FID", "FID_SD"],
         required=True,
         help="experiment type",
     )
     parser.add_argument(
         "--task",
-        choices=["simple_prompt", "diverse_prompt", "MS-COCO"],
+        choices=["general_image", "target_image"],
         required=True,
         help="task type",
     )
-
     parser.add_argument("--method", required=True)
     parser.add_argument("--target", required=True)
-    parser.add_argument("--seed", default=1)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="cuda:0")
 
     args = parser.parse_args()
 
     logger = set_logger()
 
     quality_evaluation(
-        args.metric, args.task, args.method, args.target, args.seed, args.device, logger
+        args.metric, args.task, args.method, args.target, args.device, logger
     )

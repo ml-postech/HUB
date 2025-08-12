@@ -1,0 +1,2 @@
+Portions of this project are derived from celeb-detection-oss (https://github.com/Giphy/celeb-detection-oss),
+which is licensed under the Mozilla Public License 2.0. Modifications were made under the same terms.

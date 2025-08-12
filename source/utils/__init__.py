@@ -9,5 +9,3 @@ from .util import (
     dict2namespace,
     merge_args_and_configs,
 )
-from .log import setup_logging, log_result
-from .evaluation_batch import evaluation_batch

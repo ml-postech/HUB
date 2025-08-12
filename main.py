@@ -1,58 +1,52 @@
 import os
-import datetime
-import builtins
 import argparse
 
-from source.image_generation import image_generation
-from source.utils.evaluation_batch import evaluation_batch
+from source.eval.eval_gcd import eval_with_gcd
+from source.eval.eval_nsfw import eval_nsfw
+from source.eval.eval_vlm import eval_vlm
+from source.eval.eval_selective_alignment import eval_selective_alignment
 from source.quality.evaluation import quality_evaluation
-from source.bias import bias
-from source.concept_restoration import concept_restoration
-from source.image_translation import image_translation
-from source.utils import set_logger, load_config, dict2namespace, merge_args_and_configs
-from envs import IMG_DIR, CONFIG_DIR
+from source.utils import set_logger, dict2namespace
+from envs import IMG_DIR, LANGUAGES, STYLE_LIST, CELEBRITY_LIST, IP_LIST, NSFW_LIST, NUM_TARGET_IMGS, NUM_GENERAL_IMGS
 
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--method", type=str)
-
+    parser.add_argument("--target", type=str)
     parser.add_argument("--device", type=str)
-    parser.add_argument("--seed", type=int)
     args = parser.parse_args()
-
-    # Load config
-    config = load_config(f"{CONFIG_DIR}/{args.config}")
-    config = dict2namespace(config)
-
-    args = merge_args_and_configs(config, args)
     return args
 
 
-def check_images(task, method, target, seed, device):
+def check_images(task, method, target, device):
     # Check if the images exist, if not generate them
-    dir_path = f"{IMG_DIR}/{task}/{method}/{target}/{seed}"
+    dir_path = f"{IMG_DIR}/{task}/{method}/{target}"
     try:
         assert os.path.exists(dir_path), f"Directory {dir_path} does not exist"
         assert len(os.listdir(dir_path)) > 0, f"No images in {dir_path}"
 
-        if task == "simple_prompt" or task == "diverse_prompt":
-            assert (
-                len(os.listdir(dir_path)) == 1000
-            ), f"Expected 1000 images in {dir_path}"
-        elif task == "over_erasing" or task == "selective_alignment":
-            assert (
-                len(os.listdir(dir_path)) == 500
-            ), f"Expected 500 images in {dir_path}"
-        elif task == "MS-COCO":
-            assert (
-                len(os.listdir(dir_path)) == 30000
-            ), f"Expected 30000 image in {dir_path}"
+        if task == "target_image":
+            assert (len(os.listdir(dir_path)) == NUM_TARGET_IMGS), f"Expected 10000 images in {dir_path}"
+        elif task == "general_image":
+            assert (len(os.listdir(dir_path)) == NUM_GENERAL_IMGS), f"Expected 30000 images in {dir_path}"
 
     except AssertionError as e:
         print(e)
-        image_generation(task, method, target, seed, device, logger)
+        image_generation(task, method, target, device, logger)
+
+
+def eval(task, method, target, language, device, logger):
+    if task == 'pinpoint_ness': 
+        eval_vlm(task, method, target, language)
+    elif target in CELEBRITY_LIST:
+        eval_with_gcd(task, method, target, language,device=device, logger=logger)
+    elif target in NSFW_LIST:
+        eval_nsfw(task, method, target, language, device=device, logger=logger)
+    elif target in STYLE_LIST:
+        eval_vlm(task, method, target, language, style=True)
+    elif target in IP_LIST:
+        eval_vlm(task, method, target, language, style=False)
 
 
 if __name__ == "__main__":
@@ -64,140 +58,55 @@ if __name__ == "__main__":
     # 1. Effectiveness and Faithfulness on target concept          #
     ################################################################
 
-    # * Simple prompt
-    if "simple_prompt" in args.tasks:
-        logger.info(
-            f"Evaluate images generated from simple prompt (Effectiveness and Faithfulness)"
-        )
-        check_images("simple_prompt", args.method, args.target, args.seed, args.device)
-        evaluation_batch(
-            "simple_prompt", args.method, args.target, args.seed, logger
-        )  # effectivness
+    # Target proportion
+    logger.info(f"Target proportion")
+    check_images("target_image", args.method, args.target, args.device)
+    eval('target_proportion', args.method, args.target, None, device=args.device, logger=logger)
 
-        quality_evaluation(
-            "aesthetic",
-            "simple_prompt",
-            args.method,
-            args.target,
-            args.seed,
-            args.device,
-            logger,
-        )
+    # General image quality
+    logger.info(f"General image quality")
+    for metric in ["FID", "FID_SD"]:
+        quality_evaluation(metric, "general_image", args.method, args.target, args.device, logger)
 
-    # * Diverse prompt
-    if "diverse_prompt" in args.tasks:
-        logger.info(
-            f"Evaluate images generated from diverse prompt (Effectiveness and Faithfulness)"
-        )
-        check_images("diverse_prompt", args.method, args.target, args.seed, args.device)
-        evaluation_batch(
-            "diverse_prompt", args.method, args.target, args.seed, logger
-        )  # effectivness
+    # Target image quality
+    logger.info(f"Target image quality")
+    quality_evaluation("aesthetic", "target_image", args.method, args.target, args.device, logger)
 
-        quality_evaluation(
-            "aesthetic",
-            "diverse_prompt",
-            args.method,
-            args.target,
-            args.seed,
-            args.device,
-            logger,
-        )
 
     ################################################################
-    # 2. Faithfulness and Compliance on MS-COCO                    #
+    # 2. Alignment                                                 #
     ################################################################
 
-    # * MS-COCO prompt
-    if "MS-COCO" in args.tasks:
-        logger.info(
-            f"Evaluate images generated from MS-COCO prompt (Faithfulness and Compliance)"
-        )
-        check_images("MS-COCO", args.method, args.target, args.seed, args.device)
+    # General image alignment
+    logger.info(f"General image alignment")
+    for metric in ["ImageReward", "PickScore"]:
+        quality_evaluation(metric, "general_image", args.method, args.target, args.device, logger)
 
-        quality_evaluation(
-            "FID", "MS-COCO", args.method, args.target, args.seed, args.device, logger
-        )
-        quality_evaluation(
-            "PickScore",
-            "MS-COCO",
-            args.method,
-            args.target,
-            args.seed,
-            args.device,
-            logger,
-        )
-        quality_evaluation(
-            "ImageReward",
-            "MS-COCO",
-            args.method,
-            args.target,
-            args.seed,
-            args.device,
-            logger,
-        )
+    # Target image alignment
+    logger.info(f"Target image alignment")
+    eval_selective_alignment(args.method, args.target)
+
 
     ################################################################
-    # 3. Compliance on target concept                              #
+    # 3. Pinpoint_ness                                             #
     ################################################################
 
-    # * Selective alignment
-    if "selective_alignment" in args.tasks:
-        logger.info(f"Evaluate selective alignment task")
-        check_images(
-            "selective_alignment", args.method, args.target, args.seed, args.device
-        )
-        evaluation_batch(
-            "selective_alignment", args.method, args.target, args.seed, logger
-        )
+    logger.info(f"Pinpoint_ness")
+    eval('pinpoint_ness', args.method, args.target, None, device=args.device, logger=logger)
+
 
     ################################################################
-    # 4. Robustness on side effects                                #
+    # 4. Multilingual robustness                                   #
     ################################################################
 
-    # * Over-erasing effect
-    if "over_erasing" in args.tasks:
-        logger.info(f"Evaluate over-erasing effect task")
-        check_images("over_erasing", args.method, args.target, args.seed, args.device)
-        evaluation_batch("over_erasing", args.method, args.target, args.seed, logger)
+    logger.info(f"Multilingual robustness")
+    for language in LANGUAGES:
+        eval('multilingual_robustness', args.method, args.target, language, device=args.device, logger=logger)
 
-    # * Model bias
-    if "bias" in args.tasks:
-        logger.info(f"Evaluate performance on bias")
-        bias(
-            args.method,
-            args.bias.target_class,
-            args.bias.n_samples,
-            args.bias.batch_size,
-            args.bias.use_cond,
-            args.seed,
-            args.device,
-        )
 
     ################################################################
-    # 5. Consistency in downstream applications                    #
+    # 5. Attack robustness                                         #
     ################################################################
 
-    # * 5-1 Sketch-to-image
-    if "sketch2image" in args.tasks:
-        logger.info(f"Evaluate performance on sketch to image generation")
-        image_translation(
-            args.method, args.target, "sketch2image", args.seed, args.device
-        )
-        evaluation_batch("sketch2image", args.method, args.target, args.seed, logger)
-
-    # * 5-2 Image-to-image
-    if "image2image" in args.tasks:
-        logger.info(f"Evaluate performance on image to image generation")
-        image_translation(
-            args.method, args.target, "image2image", args.seed, args.device
-        )
-        evaluation_batch("image2image", args.method, args.target, args.seed, logger)
-
-    # * 5-3 Concept restoration
-    if "concept_restoration" in args.tasks:
-        logger.info(f"Evaluate performance on concept restoration")
-        for start_t_idx in args.concept_restoration.start_t_idx:
-            concept_restoration(
-                args.method, args.target, start_t_idx, args.device, args.seed, logger
-            )
+    logger.info(f"Attack robustness")
+    eval('attack_robustness', args.method, args.target, None, device=args.device, logger=logger)

@@ -3,42 +3,58 @@ import os
 import csv
 import argparse
 from tqdm import tqdm
+from torch.utils.data import DataLoader, TensorDataset
 
 from models import load_model_sd
-from envs import IMG_DIR, PROMPT_DIR
+from envs import IMG_DIR, PROMPT_DIR, NUM_IMGS_PER_PROMPTS, LANGUAGES
 from source.utils import set_seed, set_logger
 
 
 def image_generation(task, method, target, seed, device, logger):
     set_seed(seed)
+    logger.info(f"Start image generation for {task}/{method}/{target}/")
 
-    logger.info(f"Start image generation for {task}/{method}/{target}/{seed}")
+    # Set the number of images to generate per prompt and the prompt file
+    num_per_prompt = NUM_IMGS_PER_PROMPTS[task]
+    prompt = f"{PROMPT_DIR}/{task}/{target}.csv"
 
-    # set the number of images to generate per prompt and the prompt file
-    if task == "simple_prompt":
-        num_per_prompt = 1000
-        prompt = f"{PROMPT_DIR}/simple_prompt/{target}.csv"
+    # The generation of reference images for VLM evaluation should use original SD
+    if task == "incontext_ref_image":
+        assert method == 'sd'
+        prompt = f"{PROMPT_DIR}/target_image/{target}.csv"
 
-    elif task == "diverse_prompt":
-        num_per_prompt = 10
-        prompt = f"{PROMPT_DIR}/diverse_prompt/{target}.csv"
+    # Set the prompt list
+    if task == "general_image":
+        with open("prompts/MS-COCO_val2014_30k_captions.csv", "r", encoding="utf-8") as file:
+            prompt = [row["text"] for row in csv.DictReader(file)]
 
-    elif task == "over_erasing":
-        num_per_prompt = 100
-        prompt = f"{PROMPT_DIR}/over_erasing/{target}.csv"
+    elif task == "multilingual_robustness":
+        prompts = {lang: [] for lang in LANGUAGES}
 
-    elif task == "selective_alignment":
-        num_per_prompt = 100
-        prompt = f"{PROMPT_DIR}/selective_alignment/{target}.csv"
+        with open(prompt, "r", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                for lang in LANGUAGES:
+                    prompts[lang].append(row[lang])
 
-    elif task == "MS-COCO":
-        num_per_prompt = 1
+    elif task == "pinpoint_ness":
+        with open(prompt, "r", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            prompt = [f"a photo of {row['noun']}" for row in reader][:100]
+
+    else:
+        with open(prompt, "r", encoding="utf-8") as file:
+            prompt = file.readlines()
+
 
     # Create a directory to save the generated images
-    save_dir = f"{IMG_DIR}/{task}/{method}/{target}/{seed}/"
+    save_dir = f"{IMG_DIR}/{task}/{method}/{target}/{seed}"
+    if task == "incontext_ref_image":
+        save_dir = f"{IMG_DIR}/incontext_ref_image/{target}"
     os.makedirs(save_dir, exist_ok=True)
 
     logger.info(f"Save images to {save_dir}")
+
 
     # Load the model
     model = load_model_sd(method, target, device)
@@ -46,23 +62,24 @@ def image_generation(task, method, target, seed, device, logger):
 
     logger.info(f"Model loaded: {method}/{target}")
 
-    # Set the prompt
-    if task == "MS-COCO":
-        with open(
-            "prompts/MS-COCO_val2014_30k_captions.csv", "r", encoding="utf-8"
-        ) as file:
-            prompt = [row["text"] for row in csv.DictReader(file)]
-    else:
-        with open(prompt, "r", encoding="utf-8") as file:
-            prompt = file.readlines()
 
     # Generate images
-    for i in tqdm(range(0, len(prompt))):
-        for j in range(num_per_prompt):
-            image = model(prompt[i], _is_progress_bar_enabled=False).images[0]
-            image.save(save_dir + f"{i * num_per_prompt + j}.jpg")
-        if i % 100 == 0:
-            logger.info(f"Generate {i * num_per_prompt} images")
+    if task == "multilingual_robustness":
+        for lang, lang_prompts in prompts.items():
+            lang_save_dir = f"{save_dir}/{lang}"
+            os.makedirs(lang_save_dir, exist_ok=True)
+
+            for i, prompt_text in enumerate(tqdm(lang_prompts, desc=f"Generating for {lang}")):
+                for j in range(num_per_prompt):
+                    image = model(prompt_text, _is_progress_bar_enabled=False).images[0]
+                    image.save(os.path.join(lang_save_dir, f"{i * num_per_prompt + j}.jpg"))
+            
+            logger.info(f"Completed generating images for {lang}")
+    else:
+        for i in tqdm(range(0, len(prompt))):
+            for j in tqdm(range(num_per_prompt)):
+                image = model(prompt[i], _is_progress_bar_enabled=False).images[0]
+                image.save(f"{save_dir}/{i * num_per_prompt + j}.jpg")
 
     logger.info(f"Images for {task}/{method}/{target}/{seed} are generated")
 
@@ -76,11 +93,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task",
         choices=[
-            "simple_prompt",
-            "diverse_prompt",
-            "MS-COCO",
+            "target_image",
+            "general_image",
             "selective_alignment",
-            "over_erasing",
+            "pinpoint_ness",
+            "multilingual_robustness",
+            "attack_robustness",
+            "incontext_ref_image",
         ],
         required=True,
         help="task to generate images",
@@ -93,6 +112,4 @@ if __name__ == "__main__":
 
     logger = set_logger()
 
-    image_generation(
-        args.task, args.method, args.target, args.seed, args.device, logger
-    )
+    image_generation(args.task, args.method, args.target, args.seed, args.device, logger)

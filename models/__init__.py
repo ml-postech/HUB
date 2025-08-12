@@ -2,53 +2,36 @@ import torch
 import torch.nn as nn
 from diffusers import (
     StableDiffusionPipeline,
-    StableDiffusionControlNetPipeline,
-    ControlNetModel,
     LMSDiscreteScheduler,
+    DPMSolverMultistepScheduler,
 )
 from diffusers.models.attention import BasicTransformerBlock
 
-from models.stable_diffusion_reference import StableDiffusionReferencePipeline
+from models.sld_pipeline import SLDPipeline
 from models.utils import load_model, diffuser_prefix_name, AttentionWithEraser
-from envs import PROJECT_DIR, CACHE_DIR, SD_MODEL_NAME, CONTROLNET_NAME
+from envs import PROJECT_DIR, CACHE_DIR, SD_MODEL_NAME
 
 
 def load_model_sd(
     method,
     target,
-    device,
+    device="cuda:0",
     dtype=torch.float16,
-    use_controlnet=False,
-    use_controlnet_reference=False,
 ):
     # ! Add your method in the list
-    assert method in ["sd", "esd", "uce", "salun", "ac", "sa", "receler"]
+    assert method in ["sd", "esd", "uce", "salun", "ac", "sa", "receler", "sld", "mace"]
 
-    target = target.replace(" ", "_")
+    if target in ["Nudity", "Disturbing", "Violent"]:
+        target = "NSFW"
 
-    if not use_controlnet and not use_controlnet_reference:
+    if method == "sd":
         model = StableDiffusionPipeline.from_pretrained(
             SD_MODEL_NAME, torch_dtype=dtype, cache_dir=CACHE_DIR
         )
-    elif use_controlnet:
-        controlnet = ControlNetModel.from_pretrained(
-            CONTROLNET_NAME,
-            torch_dtype=dtype,
-            use_safetensors=True,
+    elif method in ["uce", "esd", "salun", "sa"]:
+        model = StableDiffusionPipeline.from_pretrained(
+            SD_MODEL_NAME, torch_dtype=dtype, cache_dir=CACHE_DIR
         )
-        model = StableDiffusionControlNetPipeline.from_pretrained(
-            SD_MODEL_NAME,
-            controlnet=controlnet,
-            torch_dtype=dtype,
-        )
-    elif use_controlnet_reference:
-        model = StableDiffusionReferencePipeline.from_pretrained(
-            SD_MODEL_NAME,
-            safety_checker=None,
-            torch_dtype=dtype,
-        )
-
-    if method in ["esd", "uce", "salun"]:
         model.scheduler = LMSDiscreteScheduler(
             beta_start=0.00085,
             beta_end=0.012,
@@ -57,23 +40,25 @@ def load_model_sd(
         )
         model.unet.load_state_dict(
             torch.load(
-                f"{PROJECT_DIR}/models/sd/{method}/{target}.pt", map_location=device
+                f"{PROJECT_DIR}/models/{method}/{target}.pt", map_location=device
             )
         )
     elif method == "ac":
-        model = load_model(model, f"{PROJECT_DIR}/models/sd/ac/{target}.bin")
-    elif method == "sa":
-        model.unet.load_state_dict(
-            torch.load(f"{PROJECT_DIR}/models/sd/sa/{target}.pt", map_location=device)
+        model = StableDiffusionPipeline.from_pretrained(
+            SD_MODEL_NAME, torch_dtype=dtype, cache_dir=CACHE_DIR
         )
+        model = load_model(model, f"{PROJECT_DIR}/models/ac/{target}.bin")
     elif method == "receler":
+        model = StableDiffusionPipeline.from_pretrained(
+            SD_MODEL_NAME, torch_dtype=dtype, cache_dir=CACHE_DIR
+        )
         model.scheduler = LMSDiscreteScheduler(
             beta_start=0.00085,
             beta_end=0.012,
             beta_schedule="scaled_linear",
             num_train_timesteps=1000,
         )
-        ckpt_path = f"{PROJECT_DIR}/models/sd/receler/{target}.pt"
+        ckpt_path = f"{PROJECT_DIR}/models/receler/{target}.pt"
 
         eraser_ckpt = torch.load(ckpt_path, map_location=device)
 
@@ -85,6 +70,17 @@ def load_model_sd(
                 module.attn2 = attn_w_eraser
         if dtype == torch.float16:
             model.unet.half()
+    elif method == "sld":
+        model = SLDPipeline.from_pretrained(
+            "stable-diffusion-v1-5/stable-diffusion-v1-5",
+            safety_checker=None,
+            torch_dtype=dtype,
+        ).to(device)
+        if target != "NSFW":
+            model.safety_concept = target
+    elif method == "mace":
+        model = StableDiffusionPipeline.from_pretrained(f"{PROJECT_DIR}/models/{method}/{target}", torch_dtype=dtype).to(device)
+        model.scheduler = DPMSolverMultistepScheduler.from_config(model.scheduler.config)
 
     # ! elif method == 'YOUR_METHOD':
     # !    ...

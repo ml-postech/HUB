@@ -105,6 +105,15 @@ data/
 input/
 saved/
 datasets/
+models/ac/*
+models/esd/*
+models/mace/*
+models/receler/*
+models/sa/*
+models/uce/*
+models/giphy_celeb_detector/*
+models/q16/*
+models/aesthetic_predictor/*
 
 # editor, os cache directory
 .vscode/
@@ -112,12 +121,16 @@ datasets/
 __MACOSX/
 
 
-images/
+images/*
 base/
-logs/
+logs/*
 gpt_jsonl/
 scripts/
 source/visualizations/
+uoc/
+prompts/uoc_reference_prompts/
+_trash_can/
+
 */*temp*/
 */*results*/
 */*img*/
