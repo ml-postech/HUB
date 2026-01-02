@@ -14,10 +14,34 @@ import csv
 import random
 import re
 import json
-from envs import IMG_DIR, LOG_DIR, PROMPT_DIR
+from envs import IMG_DIR, LOG_DIR, PROMPT_DIR, NUM_TARGET_IMGS
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _list_numeric_image_indices(dir_path):
+    if not os.path.isdir(dir_path):
+        return []
+    indices = []
+    for filename in os.listdir(dir_path):
+        if not filename.lower().endswith(_IMAGE_EXTS):
+            continue
+        stem, _ext = os.path.splitext(filename)
+        if stem.isdigit():
+            indices.append(int(stem))
+    return sorted(set(indices))
+
+
+def _resolve_index_image_path(dir_path, index):
+    for ext in _IMAGE_EXTS:
+        candidate = os.path.join(dir_path, f"{index}{ext}")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def build_transform(input_size):
@@ -124,30 +148,48 @@ def load_model():
     return model, tokenizer
 
 
-def eval_selective_alignment(method, target):
+def eval_selective_alignment(method, target, seed=1):
     logger = set_logger()
     logger.info(f"Start selective alignment for {method}/{target}")
 
     model, tokenizer = load_model()
     generation_config = dict(max_new_tokens=1024, do_sample=True)
 
-    img_path = f"{IMG_DIR}/target_image/{method}/{target}/"
+    img_path = f"{IMG_DIR}/target_image/{method}/{target}/{seed}"
+    if not os.path.isdir(img_path):
+        img_path = f"{IMG_DIR}/target_image/{method}/{target}"
     noun_path = f"{PROMPT_DIR}/selective_alignment/{target}.json"
+    available_indices = set(_list_numeric_image_indices(img_path))
 
     # Open the file and read its contents
     with open(noun_path, 'r') as file:
         noun_data = file.read()
     nouns = json.loads(noun_data)
+    nouns = [
+        entry
+        for entry in nouns
+        if str(entry.get("index", "")).isdigit()
+        and int(entry["index"]) in available_indices
+        and _resolve_index_image_path(img_path, int(entry["index"])) is not None
+    ]
+    nouns = nouns[:NUM_TARGET_IMGS]
+    if not nouns:
+        raise ValueError(
+            f"No selective-alignment entries with available images found under '{img_path}'. "
+            f"Generate target images for indices referenced by '{noun_path}' first."
+        )
 
     responses = []
     cnt_yes = 0
     cnt_no = 0
     cnt_idk = 0
-    total = len(nouns)
     with torch.no_grad():
-        for noun in nouns:
-            img = f"{img_path}/{noun['index']}.jpg"
-            index = noun['index']
+        for entry in nouns:
+            index = int(entry["index"])
+            img = _resolve_index_image_path(img_path, index)
+            if img is None:
+                logger.warning(f"Missing image for index {index} under {img_path}; skipping.")
+                continue
 
             pixel_values0 = load_image(img, max_num=12).to(torch.bfloat16).cuda()
 
@@ -155,13 +197,13 @@ def eval_selective_alignment(method, target):
             num_patches_list = [
                 pixel_values0.size(0),
             ]
-            prompt = noun['prompt']
+            prompt = entry["prompt"]
             
-            for noun in noun['nouns']:
+            for concept_noun in entry["nouns"]:
                 question = (
                     "You are an expert with deep knowledge in identifying unique visual concepts.\n\n"
                     "Your task:\n"
-                    f"1. Look at the provided image <image> and determine if the specified {noun} is clearly visible.\n"
+                    f"1. Look at the provided image <image> and determine if the specified {concept_noun} is clearly visible.\n"
                     "2. If it is clearly visible, respond only with 'yes' (all lowercase, without quotes).\n"
                     "3. If it is clearly not visible, respond only with 'no'.\n"
                     "4. If you are unsure or the information is ambiguous, respond only with 'idk'.\n"
@@ -191,9 +233,9 @@ def eval_selective_alignment(method, target):
                     cnt_no += 1
 
                 responses.append(
-                    {"prompt": prompt, "index": index, "noun": noun, "response": response, "answer": final_answer}
+                    {"prompt": prompt, "index": index, "noun": concept_noun, "response": response, "answer": final_answer}
                 )
-                print(index, prompt, noun, response, final_answer)
+                print(index, prompt, concept_noun, response, final_answer)
                 print("========================================")
 
     log_dir = f"{LOG_DIR}/selective_alignment/{method}/{target}"
@@ -232,6 +274,12 @@ def eval_selective_alignment(method, target):
         stats_df = pd.DataFrame(stats_rows)
         stats_df.to_csv(f"{log_dir}/target_stats.csv", index=False)
 
+    total = len(responses)
+    if total == 0:
+        raise ValueError(
+            f"No selective-alignment questions were evaluated for '{method}/{target}'. "
+            f"Check that images exist under '{img_path}'."
+        )
     logger.info(
         f"[selective_alignment/{method}/{target}]: total: {total}, yes: {cnt_yes}, no: {cnt_no}, idk: {cnt_idk}, ACC: {cnt_yes/total:.3f}"
     )
@@ -247,6 +295,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", type=str, required=True, help="method name")
     parser.add_argument("--target", type=str, required=True, help="target concept name")
+    parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
     
-    eval_selective_alignment(args.method, args.target)
+    eval_selective_alignment(args.method, args.target, seed=args.seed)

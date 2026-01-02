@@ -1,3 +1,6 @@
+import os
+import warnings
+
 import torch
 import torch.nn as nn
 from diffusers import (
@@ -16,11 +19,16 @@ def load_model_sd(
     method,
     target,
     device="cuda:0",
-    dtype=torch.float16,
+    dtype=None,
 ):
+    device_str = str(device)
+    if dtype is None:
+        dtype = torch.float32 if device_str.startswith("cpu") else torch.float16
+
     # ! Add your method in the list
     assert method in ["sd", "esd", "uce", "salun", "ac", "sa", "receler", "sld", "mace"]
 
+    original_target = target
     if target in ["Nudity", "Disturbing", "Violent"]:
         target = "NSFW"
 
@@ -38,11 +46,58 @@ def load_model_sd(
             beta_schedule="scaled_linear",
             num_train_timesteps=1000,
         )
-        model.unet.load_state_dict(
-            torch.load(
-                f"{PROJECT_DIR}/models/{method}/{target}.pt", map_location=device
+        ckpt_candidates = [f"{PROJECT_DIR}/models/{method}/{target}.pt"]
+        if target == "NSFW" and original_target != "NSFW":
+            ckpt_candidates.append(f"{PROJECT_DIR}/models/{method}/{original_target}.pt")
+
+        ckpt_path = next((p for p in ckpt_candidates if os.path.isfile(p)), None)
+        if ckpt_path is None:
+            raise FileNotFoundError(
+                "Missing unlearned checkpoint file for "
+                f"method='{method}', target='{original_target}'. "
+                f"Expected one of: {', '.join(ckpt_candidates)}. "
+                "Place a UNet state_dict there (e.g. torch.save(model.unet.state_dict(), path))."
             )
-        )
+
+        unet_ckpt = torch.load(ckpt_path, map_location=device)
+        if not isinstance(unet_ckpt, dict):
+            raise TypeError(
+                f"Expected a state_dict (dict) at '{ckpt_path}', got {type(unet_ckpt)}."
+            )
+
+        # Handle common wrappers/prefixes from training checkpoints.
+        for wrapped_key in ("state_dict", "model_state_dict", "unet_state_dict", "unet"):
+            maybe = unet_ckpt.get(wrapped_key) if isinstance(unet_ckpt, dict) else None
+            if isinstance(maybe, dict):
+                unet_ckpt = maybe
+                break
+
+        cleaned = {}
+        for key, value in unet_ckpt.items():
+            if not isinstance(key, str):
+                continue
+            if key.startswith("module."):
+                key = key[len("module.") :]
+            if key.startswith("unet."):
+                key = key[len("unet.") :]
+            cleaned[key] = value
+        unet_ckpt = cleaned
+
+        model_keys = set(model.unet.state_dict().keys())
+        matched = model_keys.intersection(unet_ckpt.keys())
+        if not matched:
+            sample_keys = list(unet_ckpt.keys())[:10]
+            raise RuntimeError(
+                f"Checkpoint '{ckpt_path}' does not match diffusers UNet keys "
+                f"(0 overlapping keys). Sample keys: {sample_keys}"
+            )
+
+        missing_keys, unexpected_keys = model.unet.load_state_dict(unet_ckpt, strict=False)
+        if missing_keys or unexpected_keys:
+            warnings.warn(
+                f"Loaded '{ckpt_path}' with strict=False "
+                f"(matched={len(matched)}/{len(model_keys)}, missing={len(missing_keys)}, unexpected={len(unexpected_keys)})."
+            )
     elif method == "ac":
         model = StableDiffusionPipeline.from_pretrained(
             SD_MODEL_NAME, torch_dtype=dtype, cache_dir=CACHE_DIR

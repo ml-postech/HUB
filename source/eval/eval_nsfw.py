@@ -108,6 +108,7 @@ def eval_nsfw(method, target, task, seed, language=None, batch_size=10, device="
 
     acc = eval(image_files, clip_model, classifier, batch_size, device)
 
+    os.makedirs(f"{LOG_DIR}/results", exist_ok=True)
     with open(f"{LOG_DIR}/results/{task}.csv", 'a') as f:
         if task == 'multilingual_robustness':
             logger.info(f"[{task}/{method}/{target}/{language}] acc: {acc:.3f}")

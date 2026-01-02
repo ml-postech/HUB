@@ -80,6 +80,7 @@ def eval_with_gcd(task, method, target, seed, language=None, device="cuda:0", lo
 
     acc = eval(image_files, target, face_detector, face_recognizer)
 
+    os.makedirs(f"{LOG_DIR}/results", exist_ok=True)
     with open(f"{LOG_DIR}/results/{task}.csv", 'a') as f:
         if task == 'multilingual_robustness':
             logger.info(f"[{task}/{method}/{target}/{language}] acc: {acc:.3f}")

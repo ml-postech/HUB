@@ -1,12 +1,28 @@
 # Generate images from the unlearned model
 import os
+import sys
 import csv
+import json
 import argparse
+import math
 from tqdm import tqdm
 from torch.utils.data import DataLoader, TensorDataset
 
+# Ensure the project root is importable when running as a script:
+# `python source/image_generation.py ...`
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from models import load_model_sd
-from envs import IMG_DIR, PROMPT_DIR, NUM_IMGS_PER_PROMPTS, LANGUAGES
+from envs import (
+    IMG_DIR,
+    PROMPT_DIR,
+    NUM_IMGS_PER_PROMPTS,
+    LANGUAGES,
+    NUM_TARGET_IMGS,
+    NUM_GENERAL_IMGS,
+)
 from source.utils import set_seed, set_logger
 
 
@@ -24,9 +40,11 @@ def image_generation(task, method, target, seed, device, logger):
         prompt = f"{PROMPT_DIR}/target_image/{target}.csv"
 
     # Set the prompt list
+    last_prompt_num_per = None
     if task == "general_image":
         with open("prompts/MS-COCO_val2014_30k_captions.csv", "r", encoding="utf-8") as file:
-            prompt = [row["text"] for row in csv.DictReader(file)]
+            prompt = [row["text"] for row in csv.DictReader(file)][:NUM_GENERAL_IMGS]
+        prompt_indices = list(range(len(prompt)))
 
     elif task == "multilingual_robustness":
         prompts = {lang: [] for lang in LANGUAGES}
@@ -36,15 +54,111 @@ def image_generation(task, method, target, seed, device, logger):
             for row in reader:
                 for lang in LANGUAGES:
                     prompts[lang].append(row[lang])
+        for lang in LANGUAGES:
+            prompts[lang] = prompts[lang][:NUM_TARGET_IMGS]
 
     elif task == "pinpoint_ness":
         with open(prompt, "r", encoding="utf-8") as file:
             reader = csv.DictReader(file)
             prompt = [f"a photo of {row['noun']}" for row in reader][:100]
+        # Each prompt generates `num_per_prompt` images; cap the total number of generated images
+        # to `NUM_TARGET_IMGS` for small runs.
+        full_prompts = len(prompt)
+        max_images = full_prompts * num_per_prompt
+        if NUM_TARGET_IMGS >= max_images:
+            prompt_indices = list(range(full_prompts))
+        else:
+            full_needed_prompts = NUM_TARGET_IMGS // num_per_prompt
+            remainder = NUM_TARGET_IMGS % num_per_prompt
+            num_prompts = full_needed_prompts + (1 if remainder else 0)
+            num_prompts = min(full_prompts, max(1, num_prompts))
+            prompt_indices = list(range(num_prompts))
+            if remainder and num_prompts > 0:
+                last_prompt_num_per = remainder
 
     else:
         with open(prompt, "r", encoding="utf-8") as file:
             prompt = file.readlines()
+        if task == "incontext_ref_image":
+            full_count = len(prompt)
+            prompt_indices = None
+            multilingual_path = f"{PROMPT_DIR}/multilingual_robustness/{target}.csv"
+            if os.path.isfile(multilingual_path):
+                try:
+                    indices = []
+                    seen = set()
+                    with open(multilingual_path, "r", encoding="utf-8") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            idx = row.get("Index")
+                            if idx is None:
+                                continue
+                            try:
+                                idx = int(idx)
+                            except ValueError:
+                                continue
+                            if idx < 0 or idx >= full_count:
+                                continue
+                            if idx in seen:
+                                continue
+                            seen.add(idx)
+                            indices.append(idx)
+                            if len(indices) >= NUM_TARGET_IMGS:
+                                break
+                    if indices:
+                        prompt_indices = indices
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to read indices from {multilingual_path}; falling back to sequential prompts. Error: {e}"
+                    )
+
+            if prompt_indices is None:
+                prompt_indices = list(range(min(NUM_TARGET_IMGS, full_count)))
+        if task == "target_image":
+            full_count = len(prompt)
+            if NUM_TARGET_IMGS >= full_count:
+                prompt_indices = list(range(full_count))
+            else:
+                # For small runs, `prompts/selective_alignment/<target>.json` may reference
+                # sparse indices (e.g. 409, 1824). Generate those indices first so
+                # selective-alignment evaluation doesn't request missing images.
+                selective_path = f"{PROMPT_DIR}/selective_alignment/{target}.json"
+                prompt_indices = []
+                if os.path.isfile(selective_path):
+                    try:
+                        with open(selective_path, "r", encoding="utf-8") as f:
+                            nouns = json.loads(f.read())
+                        raw_indices = [entry.get("index") for entry in nouns]
+                        seen = set()
+                        for idx in raw_indices:
+                            if not isinstance(idx, int):
+                                continue
+                            if idx < 0 or idx >= full_count:
+                                continue
+                            if idx in seen:
+                                continue
+                            seen.add(idx)
+                            prompt_indices.append(idx)
+                            if len(prompt_indices) >= NUM_TARGET_IMGS:
+                                break
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to read indices from {selective_path}; falling back to sequential prompts. Error: {e}"
+                        )
+                        prompt_indices = []
+
+                if len(prompt_indices) < NUM_TARGET_IMGS:
+                    selected = set(prompt_indices)
+                    for idx in range(full_count):
+                        if idx in selected:
+                            continue
+                        prompt_indices.append(idx)
+                        if len(prompt_indices) >= NUM_TARGET_IMGS:
+                            break
+        else:
+            prompt_indices = list(range(len(prompt)))
+            if task == "attack_robustness":
+                prompt_indices = prompt_indices[: min(NUM_TARGET_IMGS, len(prompt_indices))]
 
 
     # Create a directory to save the generated images
@@ -76,8 +190,11 @@ def image_generation(task, method, target, seed, device, logger):
             
             logger.info(f"Completed generating images for {lang}")
     else:
-        for i in tqdm(range(0, len(prompt))):
-            for j in tqdm(range(num_per_prompt)):
+        for i in tqdm(prompt_indices):
+            per_prompt = num_per_prompt
+            if task == "pinpoint_ness" and last_prompt_num_per is not None and i == prompt_indices[-1]:
+                per_prompt = last_prompt_num_per
+            for j in tqdm(range(per_prompt)):
                 image = model(prompt[i], _is_progress_bar_enabled=False).images[0]
                 image.save(f"{save_dir}/{i * num_per_prompt + j}.jpg")
 
